@@ -5,14 +5,19 @@ maintain a JSON override file, and build modified CSVs for injection.
 import csv
 import json
 import io
+import logging
 import os
+import shutil
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from gpak_manager import extract_files
 
 # ---------- configuration ----------
 
+# Must match the column headers in the game's localization CSVs.
+# Update this list if the game adds new language support.
 LANGUAGES = ["en", "sp", "fr", "de", "it", "pt-br"]
 LANGUAGE_LABELS = {
     "en": "English", "sp": "Español", "fr": "Français",
@@ -154,6 +159,17 @@ def save_overrides(overrides, gpak_path):
                   indent=2, ensure_ascii=False)
 
 
+def _backup_corrupt_json(path):
+    """Rename a corrupt JSON file so the user can inspect it later."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup = path.with_suffix(f".corrupt_{ts}.json")
+    try:
+        shutil.copy2(path, backup)
+        logging.warning(f"Corrupt override file backed up to: {backup}")
+    except OSError as e:
+        logging.warning(f"Could not back up corrupt file {path}: {e}")
+
+
 def load_overrides(gpak_path):
     """Load overrides. Returns {} if file absent or corrupt."""
     path = _overrides_path(gpak_path)
@@ -162,7 +178,9 @@ def load_overrides(gpak_path):
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f).get("overrides", {})
-    except (json.JSONDecodeError, KeyError, OSError):
+    except (json.JSONDecodeError, KeyError, OSError) as e:
+        logging.warning(f"Override file is corrupt or unreadable ({path}): {e}")
+        _backup_corrupt_json(path)
         return {}
 
 # ---------- CSV rewriting ----------
@@ -236,60 +254,164 @@ def build_all_csvs(source_gpak_path, overrides):
             result[csv_path] = raw  # restore original
     return result
 
+
+def build_merge_csvs(source_gpak_path, overrides):
+    """
+    Build {csv_path.merge: bytes} with ALL rows from the original CSV.
+    Overridden rows have their name columns filled; non-overridden rows
+    have all columns blank (empty) so the engine keeps the original values.
+    CSVs with zero overrides are not included.
+    """
+    csv_paths = [src["csv_path"] for src in ENTITY_SOURCES]
+    originals = extract_files(str(source_gpak_path), csv_paths)
+
+    # Group overrides by csv_path
+    grouped = {}
+    for key, langs in overrides.items():
+        for p in csv_paths:
+            if _key_belongs_to_csv(key, p):
+                grouped.setdefault(p, {})[key] = langs
+                break
+
+    result = {}
+    for csv_path, csv_ovr in grouped.items():
+        raw = originals.get(csv_path)
+        if raw is None:
+            continue
+        header, rows = _parse_csv(raw)
+        if not header:
+            continue
+        li = _lang_indices(header)
+        ncols = len(header)
+
+        # Build merge file: header + ALL rows
+        # Overridden rows get their values; others are blank (engine keeps original)
+        out_rows = [header]
+        for row in rows:
+            if not row or not row[0].strip():
+                continue
+            key = row[0].strip()
+            if key in csv_ovr:
+                # Overridden row: blank base, fill only overridden language columns
+                merge_row = [""] * ncols
+                for lang, new_val in csv_ovr[key].items():
+                    idx = li.get(lang)
+                    if idx is not None:
+                        merge_row[idx] = new_val
+                out_rows.append(merge_row)
+            else:
+                # Non-overridden row: all blank (engine keeps original)
+                out_rows.append([""] * ncols)
+
+        buf = io.StringIO()
+        csv.writer(buf, lineterminator="\n").writerows(out_rows)
+        result[csv_path + ".merge"] = ("\ufeff" + buf.getvalue()).encode("utf-8")
+
+    return result
+
 # ---------- loose file management ----------
 
-def write_loose_files(game_dir, csv_data):
+def write_loose_files(game_dir, file_data, output_dir=None):
     """
-    Write modified CSV files as loose files next to the game exe.
+    Write override files as loose files.
 
     Args:
         game_dir: Path to the game directory (where Mewgenics.exe lives)
-        csv_data: {csv_path: bytes} from build_all_csvs()
+        file_data: {rel_path: bytes} from build_merge_csvs() or build_catname_files()
+        output_dir: If set, write to this dir instead of game_dir (Mewtator mode)
 
     Returns:
         list of Path objects that were written
+
+    On failure, all successfully written files are deleted to avoid
+    leaving partial overrides that would confuse the game engine.
     """
+    base = Path(output_dir) if output_dir else Path(game_dir)
     written = []
-    for csv_path, data in csv_data.items():
-        target = Path(game_dir) / csv_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-        written.append(target)
+    try:
+        for rel_path, data in file_data.items():
+            target = base / rel_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            written.append(target)
+    except Exception:
+        # Rollback: delete all files written so far
+        for p in written:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
     return written
 
 
-def remove_loose_files(game_dir):
+def _all_loose_paths():
+    """All possible loose file relative paths (merge + legacy full + catname pools)."""
+    paths = []
+    for src in ENTITY_SOURCES:
+        paths.append(src["csv_path"])           # legacy full CSV
+        paths.append(src["csv_path"] + ".merge")  # merge CSV
+    for p in CATNAME_POOLS:
+        paths.append(p["gpak_path"])
+    return paths
+
+
+def remove_loose_files(game_dir, output_dir=None):
     """
-    Remove all loose override files (CSVs + cat name pools) and clean up empty dirs.
+    Remove all loose override files (merge CSVs, legacy CSVs, cat name pools).
+    Cleans up empty dirs afterwards.
 
     Returns:
         list of Path objects that were deleted
     """
+    base = Path(output_dir) if output_dir else Path(game_dir)
     removed = []
-    all_paths = [src["csv_path"] for src in ENTITY_SOURCES] + \
-                [p["gpak_path"] for p in CATNAME_POOLS]
-    for rel_path in all_paths:
-        target = Path(game_dir) / rel_path
+    for rel_path in _all_loose_paths():
+        target = base / rel_path
         if target.exists():
             target.unlink()
             removed.append(target)
 
-    # Clean up empty directories
+    # Clean up description.json in Mewtator mode
+    if output_dir:
+        meta = base / "description.json"
+        if meta.exists():
+            meta.unlink()
+            removed.append(meta)
+
+    # Clean up empty directories (deepest first)
     for subdir in ["data/text", "data"]:
-        d = Path(game_dir) / subdir
+        d = base / subdir
         if d.exists() and not any(d.iterdir()):
             d.rmdir()
+    # Clean mod folder itself if empty (Mewtator)
+    if output_dir and base.exists() and not any(base.iterdir()):
+        base.rmdir()
 
     return removed
 
 
-def has_loose_files(game_dir):
-    """Check if any loose override files (CSVs or cat name pools) exist."""
+def has_loose_files(game_dir, output_dir=None):
+    """Check if any loose override files exist."""
     if game_dir is None:
         return False
-    all_paths = [src["csv_path"] for src in ENTITY_SOURCES] + \
-                [p["gpak_path"] for p in CATNAME_POOLS]
-    return any((Path(game_dir) / p).exists() for p in all_paths)
+    base = Path(output_dir) if output_dir else Path(game_dir)
+    return any((base / p).exists() for p in _all_loose_paths())
+
+
+def write_mewtator_meta(output_dir):
+    """Write description.json for Mewtator mod loader discovery."""
+    from constants import APP_VERSION
+    meta = Path(output_dir) / "description.json"
+    meta.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "title": "MewgenicsRenamer",
+        "description": "Custom entity and cat name overrides",
+        "author": "Wawax007",
+        "version": APP_VERSION,
+    }
+    with open(meta, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
 # ---------- cat name pools ----------
 
@@ -322,8 +444,9 @@ def save_catname_overrides(catname_overrides, gpak_path):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            pass
+        except (json.JSONDecodeError, OSError) as e:
+            logging.warning(f"Could not read existing overrides ({path}): {e}")
+            _backup_corrupt_json(path)
     data["catname_pools"] = catname_overrides
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
@@ -337,7 +460,9 @@ def load_catname_overrides(gpak_path):
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f).get("catname_pools", {})
-    except (json.JSONDecodeError, KeyError, OSError):
+    except (json.JSONDecodeError, KeyError, OSError) as e:
+        logging.warning(f"Catname override file is corrupt or unreadable ({path}): {e}")
+        _backup_corrupt_json(path)
         return {}
 
 

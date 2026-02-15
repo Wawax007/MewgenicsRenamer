@@ -1,13 +1,26 @@
 import struct
+import logging
 from dataclasses import dataclass, field
 
 import lz4.block
 
 
-# Decompressed/raw cat data format constants
-_CAT_MAGIC = 0x13            # uint32 at offset 0 of raw cat data
-_NAME_LEN_OFFSET = 12        # uint32 LE: character count
-_NAME_START = 20             # UTF-16LE name begins here
+# Cat blob format (stored as LZ4-compressed or raw in SQLite):
+#   Compressed: [u32 uncompressed_size][lz4 block]
+#   Raw:        directly the decompressed layout below
+#
+# Decompressed layout:
+#   [0:4]   u32 LE  magic = 0x13
+#   [4:12]  8 bytes seed
+#   [12:16] u32 LE  name_len (character count, NOT byte count)
+#   [16:20] u32 LE  padding = 0
+#   [20:…]  UTF-16LE name (name_len * 2 bytes)
+#   [… ]    binary data (stats, abilities, etc.)
+
+_CAT_MAGIC = 0x13
+_NAME_LEN_OFFSET = 12
+_NAME_START = 20
+_MAX_NAME_CHARS = 500  # safety cap (game limit is 24)
 
 
 @dataclass
@@ -38,8 +51,10 @@ def unpack_blob(blob):
                 if (len(data) >= _NAME_START
                         and struct.unpack_from('<I', data, 0)[0] == _CAT_MAGIC):
                     return data, True
-        except Exception:
-            pass
+        except lz4.block.LZ4BlockError:
+            pass  # Not a valid LZ4 block — fall through to raw format check
+        except Exception as e:
+            logging.debug(f"Unexpected error during LZ4 decompression: {e}")
 
     # Try raw (uncompressed) format
     if (len(blob) >= _NAME_START
@@ -64,7 +79,7 @@ def is_cat_blob(blob):
     try:
         unpack_blob(blob)
         return True
-    except (ValueError, Exception):
+    except ValueError:
         return False
 
 
@@ -80,6 +95,12 @@ def parse_display_name(blob):
     name_len = struct.unpack_from('<I', data, _NAME_LEN_OFFSET)[0]
     if name_len == 0:
         return ("", _NAME_START, 0)
+
+    if name_len > _MAX_NAME_CHARS:
+        raise ValueError(
+            f"Name length {name_len} exceeds safety limit of {_MAX_NAME_CHARS} chars "
+            f"(likely corrupted blob)"
+        )
 
     name_byte_count = name_len * 2
     name_end = _NAME_START + name_byte_count

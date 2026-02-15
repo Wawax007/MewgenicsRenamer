@@ -42,6 +42,9 @@ def replace_display_name(blob, new_name):
     data, is_compressed = unpack_blob(blob)
 
     old_name_len = struct.unpack_from('<I', data, _NAME_LEN_OFFSET)[0]
+    if old_name_len > 500:
+        raise ValueError(
+            f"Existing name length {old_name_len} is unreasonably large (likely corrupted blob)")
     old_name_end = _NAME_START + old_name_len * 2
 
     new_name_encoded = new_name.encode('utf-16-le')

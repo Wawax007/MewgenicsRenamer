@@ -141,21 +141,59 @@ def get_all_entries(conn):
     return entries
 
 
+VALID_TABLES = {"cats", "files", "winning_teams", "properties"}
+
+
 def write_blob(save_path, table, key, new_blob):
-    """Write a modified blob back to any table in the save file."""
-    conn = open_save_rw(save_path)
+    """Write a modified blob back to any table in the save file.
+
+    Verifies the write BEFORE committing so the transaction can be
+    rolled back on mismatch instead of leaving a corrupt save.
+    """
+    if table not in VALID_TABLES:
+        raise ValueError(f"Invalid table name: {table!r}")
+    conn = None
     try:
+        conn = open_save_rw(save_path)
         conn.execute(
             f"UPDATE [{table}] SET data = ? WHERE key = ?",
             (new_blob, key)
         )
-        conn.commit()
+        # Verify BEFORE commit — within the same transaction we can
+        # read our own uncommitted changes.  On mismatch we rollback.
         row = conn.execute(
             f"SELECT data FROM [{table}] WHERE key = ?",
             (key,)
         ).fetchone()
         if row is None or row[0] != new_blob:
-            raise IOError("Write verification failed — blob mismatch after write")
+            conn.rollback()
+            raise IOError("Write verification failed — blob mismatch (rolled back, save unchanged)")
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        if conn:
+            conn.close()
+
+
+def read_blob(save_path, table, key):
+    """Read a single blob from a save file.
+
+    Returns the raw blob bytes, or None if not found.
+    """
+    if table not in VALID_TABLES:
+        raise ValueError(f"Invalid table name: {table!r}")
+    conn = open_save(save_path)
+    try:
+        row = conn.execute(
+            f"SELECT data FROM [{table}] WHERE key = ?",
+            (key,)
+        ).fetchone()
+        return row[0] if row else None
     finally:
         conn.close()
 
@@ -232,17 +270,18 @@ def is_game_running():
         snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
         if snap == -1:
             return False
-        pe = PROCESSENTRY32()
-        pe.dwSize = ctypes.sizeof(PROCESSENTRY32)
-        target = GAME_PROCESS_NAME.lower().encode()
-        if kernel32.Process32First(snap, ctypes.byref(pe)):
-            while True:
-                if pe.szExeFile.lower() == target:
-                    kernel32.CloseHandle(snap)
-                    return True
-                if not kernel32.Process32Next(snap, ctypes.byref(pe)):
-                    break
-        kernel32.CloseHandle(snap)
+        try:
+            pe = PROCESSENTRY32()
+            pe.dwSize = ctypes.sizeof(PROCESSENTRY32)
+            target = GAME_PROCESS_NAME.lower().encode()
+            if kernel32.Process32First(snap, ctypes.byref(pe)):
+                while True:
+                    if pe.szExeFile.lower() == target:
+                        return True
+                    if not kernel32.Process32Next(snap, ctypes.byref(pe)):
+                        break
+        finally:
+            kernel32.CloseHandle(snap)
     except Exception:
         pass
     return False
@@ -258,3 +297,23 @@ def list_backups(save_path):
     backups = list(backup_dir.glob(f"{save_path.stem}_renamer_*{BACKUP_EXTENSION}"))
     backups.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return backups
+
+
+MAX_BACKUPS = 20
+
+
+def cleanup_old_backups(save_path, keep=MAX_BACKUPS):
+    """Delete old backups beyond the most recent `keep` count.
+
+    Returns the number of backups deleted.
+    """
+    backups = list_backups(save_path)
+    to_delete = backups[keep:]
+    deleted = 0
+    for bp in to_delete:
+        try:
+            bp.unlink()
+            deleted += 1
+        except OSError:
+            pass
+    return deleted

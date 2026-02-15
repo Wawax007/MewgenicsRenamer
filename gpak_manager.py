@@ -14,14 +14,24 @@ def parse_file_table(gpak_path):
     """Parse gpak file table. Returns list of {path, size, offset}."""
     with open(gpak_path, 'rb') as f:
         # Read file table into memory in one shot (~1 MB for 18K entries)
-        file_count = struct.unpack('<I', f.read(4))[0]
+        header = f.read(4)
+        if len(header) < 4:
+            raise ValueError(f"GPAK too small: {gpak_path}")
+        file_count = struct.unpack('<I', header)[0]
+        if file_count > 100_000:
+            raise ValueError(f"Unreasonable file count {file_count} in {gpak_path}")
         buf = f.read(2 * 1024 * 1024)  # 2 MB covers any file table
 
+    buf_len = len(buf)
     entries = []
     pos = 0
     for _ in range(file_count):
+        if pos + 6 > buf_len:  # need at least path_len (2) + data_size (4)
+            raise ValueError(f"Truncated file table in {gpak_path} at entry {len(entries)}")
         path_len = struct.unpack_from('<H', buf, pos)[0]
         pos += 2
+        if path_len > 1024 or pos + path_len + 4 > buf_len:
+            raise ValueError(f"Invalid path length {path_len} at entry {len(entries)}")
         path = buf[pos:pos + path_len].decode('utf-8')
         pos += path_len
         data_size = struct.unpack_from('<I', buf, pos)[0]
@@ -49,6 +59,19 @@ def extract_files(gpak_path, file_paths):
                 f.seek(entry["offset"])
                 result[fp] = f.read(entry["size"])
     return result
+
+
+def is_valid_gpak(path):
+    """Quick sanity check: can we read the file count header?"""
+    try:
+        with open(path, 'rb') as f:
+            data = f.read(4)
+            if len(data) < 4:
+                return False
+            count = struct.unpack('<I', data)[0]
+            return 0 < count < 100_000  # reasonable file count
+    except OSError:
+        return False
 
 
 def find_gpak():

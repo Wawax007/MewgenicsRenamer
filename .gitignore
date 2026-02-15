@@ -8,3 +8,6 @@ dist/
 *.exe
 debug.log
 name_overrides.json
+catname_overrides.json
+settings.json
+nul
